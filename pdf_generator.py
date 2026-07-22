@@ -1,5 +1,6 @@
 import os
 import urllib.request
+import tempfile
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -7,16 +8,22 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-# ลิงก์ดาวน์โหลดฟอนต์ภาษาไทยสำรองสำหรับรันบน Linux/Cloud
-THAI_FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/sarabun/Sarabun-Regular.ttf"
-THAI_FONT_BOLD_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/sarabun/Sarabun-Bold.ttf"
-
 def register_fonts():
-    """ลงทะเบียนฟอนต์ภาษาไทยสำหรับ Windows และ Linux (Cloud Render)"""
-    font_name = "Helvetica"
-    font_bold = "Helvetica-Bold"
+    """ลงทะเบียนฟอนต์ภาษาไทยสำหรับการใช้งานบน Windows, Linux และ Vercel Serverless"""
+    # 1. ตรวจสอบฟอนต์ในโฟลเดอร์ fonts/ ของโปรเจกต์ (การันตี 100% สำหรับ Vercel และ Cloud)
+    base_dir = os.path.dirname(__file__)
+    bundled_font = os.path.join(base_dir, "fonts", "Sarabun-Regular.ttf")
+    bundled_font_bold = os.path.join(base_dir, "fonts", "Sarabun-Bold.ttf")
     
-    # 1. ลองหาฟอนต์ในเครื่อง (Windows)
+    if os.path.exists(bundled_font) and os.path.exists(bundled_font_bold):
+        try:
+            pdfmetrics.registerFont(TTFont("Sarabun", bundled_font))
+            pdfmetrics.registerFont(TTFont("Sarabun-Bold", bundled_font_bold))
+            return "Sarabun", "Sarabun-Bold"
+        except Exception as e:
+            print(f"Error loading bundled Sarabun font: {e}")
+
+    # 2. ลองตรวจสอบฟอนต์ Windows
     thai_font_paths = [
         ("C:/Windows/Fonts/tahoma.ttf", "Tahoma"),
         ("C:/Windows/Fonts/angsa.ttf", "AngsanaUPC"),
@@ -26,29 +33,27 @@ def register_fonts():
         if os.path.exists(path):
             try:
                 pdfmetrics.registerFont(TTFont(name, path))
-                font_name = name
-                font_bold = name
-                return font_name, font_bold
+                return name, name
             except Exception:
                 pass
-                
-    # 2. หากรันบน Cloud (Linux) ให้ดาวน์โหลด Sarabun (Google Font) มาใช้ในโฟลเดอร์ท้องถิ่น
-    local_font = "Sarabun-Regular.ttf"
-    local_font_bold = "Sarabun-Bold.ttf"
+
+    # 3. สำรอง: ดาวน์โหลดไปไว้ในโฟลเดอร์ /tmp (เพื่อหลีกเลี่ยง Read-only filesystem บน Vercel)
+    tmp_dir = tempfile.gettempdir()
+    local_font = os.path.join(tmp_dir, "Sarabun-Regular.ttf")
+    local_font_bold = os.path.join(tmp_dir, "Sarabun-Bold.ttf")
     try:
         if not os.path.exists(local_font):
-            urllib.request.urlretrieve(THAI_FONT_URL, local_font)
+            urllib.request.urlretrieve("https://raw.githubusercontent.com/google/fonts/main/ofl/sarabun/Sarabun-Regular.ttf", local_font)
         if not os.path.exists(local_font_bold):
-            urllib.request.urlretrieve(THAI_FONT_BOLD_URL, local_font_bold)
+            urllib.request.urlretrieve("https://raw.githubusercontent.com/google/fonts/main/ofl/sarabun/Sarabun-Bold.ttf", local_font_bold)
             
         pdfmetrics.registerFont(TTFont("Sarabun", local_font))
         pdfmetrics.registerFont(TTFont("Sarabun-Bold", local_font_bold))
-        font_name = "Sarabun"
-        font_bold = "Sarabun-Bold"
+        return "Sarabun", "Sarabun-Bold"
     except Exception as e:
         print(f"Warning: Could not register Thai font: {e}")
-        
-    return font_name, font_bold
+
+    return "Helvetica", "Helvetica-Bold"
 
 def create_payment_voucher_pdf(output_path: str, data: dict):
     """
@@ -107,12 +112,13 @@ def create_payment_voucher_pdf(output_path: str, data: dict):
     voucher_no = data.get("voucher_no", "")
     voucher_date = data.get("date", "")
     pay_to = data.get("pay_to", "")
+    pay_to_paragraph = Paragraph(pay_to, normal_style)
     
     meta_table = Table(
         [
             [
                 Paragraph(f"<b>Pay to:</b>", normal_style),
-                Paragraph(f"{pay_to}", normal_style),
+                pay_to_paragraph,
                 Paragraph(f"<b>No:</b> {voucher_no}", normal_style)
             ],
             [
