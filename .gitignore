@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+generated_vouchers/
+ngrok.exe
+ngrok.zip
+test_voucher_output.pdf
+test_voucher_result.pdf
