@@ -95,8 +95,10 @@ def handle_file_or_image_message(event):
         # 1. OCR ด้วย Gemini API
         extracted_data = extract_receipt_data(file_bytes, mime_type=mime_type)
 
-        # 2. สร้างเลขที่ Voucher
-        voucher_id = f"PV-{uuid.uuid4().hex[:6].upper()}"
+        # 2. ใช้เลขที่เอกสาร/ใบเสร็จจริงที่ AI อ่านได้ (หากอ่านไม่ได้/ไม่มี ค่อยสร้างเลขสุ่ม PV-XXXXXX)
+        voucher_id = extracted_data.get("voucher_no")
+        if not voucher_id or str(voucher_id).strip() in ["", "-", "None"]:
+            voucher_id = f"PV-{uuid.uuid4().hex[:6].upper()}"
         extracted_data["voucher_no"] = voucher_id
 
         # 3. สร้างไฟล์ PDF
