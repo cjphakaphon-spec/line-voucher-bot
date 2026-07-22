@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
-    MessageEvent, ImageMessage, TextSendMessage, FlexSendMessage,
+    MessageEvent, ImageMessage, FileMessage, TextSendMessage, FlexSendMessage,
     BubbleContainer, BoxComponent, TextComponent, ButtonComponent, URIAction
 )
 
@@ -62,10 +62,22 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
     return "OK"
 
-@handler.add(MessageEvent, message=ImageMessage)
-def handle_image_message(event):
+@handler.add(MessageEvent, message=(ImageMessage, FileMessage))
+def handle_file_or_image_message(event):
     reply_token = event.reply_token
     message_id = event.message.id
+    message_type = event.message.type
+
+    # ระบุ MIME Type ตามประเภทไฟล์
+    mime_type = "image/jpeg"
+    if message_type == "file":
+        file_name = getattr(event.message, "file_name", "").lower()
+        if file_name.endswith(".pdf"):
+            mime_type = "application/pdf"
+        elif file_name.endswith(".png"):
+            mime_type = "image/png"
+        elif file_name.endswith(".jpg") or file_name.endswith(".jpeg"):
+            mime_type = "image/jpeg"
 
     # แจ้งเตือนผู้ใช้ว่ากำลังประมวลผล
     line_bot_api.reply_message(
@@ -74,14 +86,14 @@ def handle_image_message(event):
     )
 
     try:
-        # ดึงไฟล์รูปภาพจาก LINE API
+        # ดึงไฟล์รูปภาพ/เอกสารจาก LINE API
         message_content = line_bot_api.get_message_content(message_id)
-        image_bytes = b""
+        file_bytes = b""
         for chunk in message_content.iter_content():
-            image_bytes += chunk
+            file_bytes += chunk
 
         # 1. OCR ด้วย Gemini API
-        extracted_data = extract_receipt_data(image_bytes)
+        extracted_data = extract_receipt_data(file_bytes, mime_type=mime_type)
 
         # 2. สร้างเลขที่ Voucher
         voucher_id = f"PV-{uuid.uuid4().hex[:6].upper()}"

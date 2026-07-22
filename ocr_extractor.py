@@ -9,7 +9,7 @@ load_dotenv()
 PROMPT_EXTRACT_RECEIPT = """
 คุณคือผู้เชี่ยวชาญด้านการบัญชีและการอ่านเอกสารใบเสร็จ/ใบกำกับภาษีภาษาไทยและอังกฤษ
 
-กรุณาวิเคราะห์รูปภาพใบเสร็จ/ใบกำกับภาษีที่แนบมานี้ แล้วสกัดข้อมูลลงในรูปแบบ JSON ต่อไปนี้เท่านั้น (ไม่ต้องมีคำอธิบายเพิ่มเติม นอกเหนือจาก JSON):
+กรุณาวิเคราะห์เอกสารใบเสร็จ/ใบกำกับภาษีที่แนบมานี้ (ทั้งรูปภาพและไฟล์ PDF) แล้วสกัดข้อมูลลงในรูปแบบ JSON ต่อไปนี้เท่านั้น (ไม่ต้องมีคำอธิบายเพิ่มเติม นอกเหนือจาก JSON):
 
 {
   "pay_to": "ชื่อบริษัท/ผู้ขาย/ซัพพลายเออร์ที่ออกใบเสร็จ (Pay to)",
@@ -29,9 +29,9 @@ PROMPT_EXTRACT_RECEIPT = """
 3. ค่าที่เป็นตัวเลขให้ส่งเฉพาะตัวเลข float ห้ามใส่เครื่องหมายจุลภาค (,) หรือสัญลักษณ์สกุลเงิน
 """
 
-def extract_receipt_data(image_bytes: bytes, api_key: str = None) -> Dict[str, Any]:
+def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_key: str = None) -> Dict[str, Any]:
     """
-    อ่านข้อมูลใบเสร็จจากรูปภาพโดยใช้ Gemini Vision API พร้อมระบบโมเดลสำรอง
+    อ่านข้อมูลใบเสร็จจากรูปภาพหรือไฟล์ PDF โดยใช้ Gemini Vision API พร้อมระบบโมเดลสำรอง
     """
     if not api_key:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -39,9 +39,7 @@ def extract_receipt_data(image_bytes: bytes, api_key: str = None) -> Dict[str, A
     if not api_key:
         raise ValueError("กรุณากำหนด GEMINI_API_KEY ในระบบ หรือส่งผ่านอาร์กิวเมนต์")
 
-    # รายชื่อโมเดลเรียงตามลำดับความเสถียรและโควตาฟรี
     models_to_try = ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.0-flash-lite"]
-    
     last_error = None
 
     # ลองใช้ SDK ของ Google Generative AI
@@ -49,14 +47,16 @@ def extract_receipt_data(image_bytes: bytes, api_key: str = None) -> Dict[str, A
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         
-        import io
-        from PIL import Image
-        img = Image.open(io.BytesIO(image_bytes))
+        # หากเป็นรูปภาพ ใช้ PIL Image หรือ Dict Part
+        part_content = {
+            "mime_type": mime_type if mime_type else "image/jpeg",
+            "data": file_bytes
+        }
 
         for model_name in models_to_try:
             try:
                 model = genai.GenerativeModel(model_name)
-                response = model.generate_content([PROMPT_EXTRACT_RECEIPT, img])
+                response = model.generate_content([PROMPT_EXTRACT_RECEIPT, part_content])
                 text = response.text.strip()
                 
                 if text.startswith("```json"):
@@ -93,7 +93,7 @@ def extract_receipt_data(image_bytes: bytes, api_key: str = None) -> Dict[str, A
         
     # HTTP REST Fallback
     import urllib.request
-    b64_image = base64.b64encode(image_bytes).decode('utf-8')
+    b64_data = base64.b64encode(file_bytes).decode('utf-8')
     
     for model_name in models_to_try:
         try:
@@ -106,8 +106,8 @@ def extract_receipt_data(image_bytes: bytes, api_key: str = None) -> Dict[str, A
                             {"text": PROMPT_EXTRACT_RECEIPT},
                             {
                                 "inline_data": {
-                                    "mime_type": "image/jpeg",
-                                    "data": b64_image
+                                    "mime_type": mime_type if mime_type else "image/jpeg",
+                                    "data": b64_data
                                 }
                             }
                         ]
