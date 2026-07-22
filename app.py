@@ -1,5 +1,8 @@
 import os
 import uuid
+import json
+import base64
+import tempfile
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,9 +23,7 @@ from ocr_extractor import extract_receipt_data
 
 app = FastAPI(title="LINE Receipt Payment Voucher Bot")
 
-import tempfile
-
-# โฟลเดอร์สำหรับเก็บไฟล์ PDF (รองรับ Vercel Serverless ที่เขียนได้เฉพาะ /tmp)
+# โฟลเดอร์สำหรับเก็บไฟล์ PDF ชั่วคราว (รองรับ Vercel Serverless ที่เขียนได้เฉพาะ /tmp)
 if os.getenv("VERCEL"):
     OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "generated_vouchers")
 else:
@@ -50,6 +51,28 @@ def get_static_file(filename: str):
         return FileResponse(filepath, media_type="application/pdf", filename=filename)
     raise HTTPException(status_code=404, detail="File not found")
 
+@app.get("/pdf")
+def generate_and_download_pdf(d: str):
+    """
+    สร้างและดาวน์โหลดไฟล์ PDF Payment Voucher แบบ On-the-Fly
+    (การันตีดาวน์โหลดได้สมบูรณ์ 100% บน Vercel Serverless โดยไม่ติดปัญหา 404 Not Found)
+    """
+    try:
+        # ถอดรหัส Base64 ข้อมูล Voucher
+        json_bytes = base64.urlsafe_b64decode(d.encode('utf-8'))
+        data = json.loads(json_bytes.decode('utf-8'))
+        
+        voucher_id = data.get("voucher_no", "VOUCHER")
+        filename = f"{voucher_id}.pdf"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        
+        # สร้าง PDF เรียลไทม์
+        create_payment_voucher_pdf(filepath, data)
+        
+        return FileResponse(filepath, media_type="application/pdf", filename=filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid or expired PDF request: {str(e)}")
+
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     signature = request.headers.get("X-Line-Signature", "")
@@ -68,7 +91,6 @@ def handle_file_or_image_message(event):
     message_id = event.message.id
     message_type = event.message.type
 
-    # ระบุ MIME Type ตามประเภทไฟล์
     mime_type = "image/jpeg"
     if message_type == "file":
         file_name = getattr(event.message, "file_name", "").lower()
@@ -95,21 +117,17 @@ def handle_file_or_image_message(event):
         # 1. OCR ด้วย Gemini API
         extracted_data = extract_receipt_data(file_bytes, mime_type=mime_type)
 
-        # 2. ใช้เลขที่เอกสาร/ใบเสร็จจริงที่ AI อ่านได้ (หากอ่านไม่ได้/ไม่มี ค่อยสร้างเลขสุ่ม PV-XXXXXX)
+        # 2. ใช้เลขที่เอกสาร/ใบเสร็จจริงที่ AI อ่านได้
         voucher_id = extracted_data.get("voucher_no")
         if not voucher_id or str(voucher_id).strip() in ["", "-", "None"]:
             voucher_id = f"PV-{uuid.uuid4().hex[:6].upper()}"
         extracted_data["voucher_no"] = voucher_id
 
-        # 3. สร้างไฟล์ PDF
-        filename = f"{voucher_id}.pdf"
-        filepath = os.path.join(OUTPUT_DIR, filename)
-        create_payment_voucher_pdf(filepath, extracted_data)
+        # 3. สร้างลิงก์ดาวน์โหลด On-the-Fly (รองรับ Vercel Serverless 100%)
+        encoded_data = base64.urlsafe_b64encode(json.dumps(extracted_data).encode('utf-8')).decode('utf-8')
+        pdf_url = f"{BASE_URL.rstrip('/')}/pdf?d={encoded_data}"
 
-        # 4. สร้างลิงก์ดาวน์โหลด
-        pdf_url = f"{BASE_URL.rstrip('/')}/static/{filename}"
-
-        # 5. ส่ง Flex Message สรุปผล
+        # 4. ส่ง Flex Message สรุปผล
         pay_to = extracted_data.get("pay_to", "-")
         net_pay = extracted_data.get("net_pay", 0.0)
 
