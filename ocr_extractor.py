@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import re
 from typing import Dict, Any
 from dotenv import load_dotenv
 
@@ -24,10 +25,24 @@ PROMPT_EXTRACT_RECEIPT = """
 }
 
 กฎเพิ่มเติม:
-1. หากไม่พบยอด VAT ชัดเจน แต่เป็นใบกำกับภาษี ให้คำนวณ VAT = amount * 0.07 โดยประมาณ
-2. หากเป็นบริการ ให้ระบุ W/H Tax 3% หรือตามที่ระบุในเอกสาร
-3. ค่าที่เป็นตัวเลขให้ส่งเฉพาะตัวเลข float ห้ามใส่เครื่องหมายจุลภาค (,) หรือสัญลักษณ์สกุลเงิน
+1. ข้อระวัง OCR เลขที่เอกสาร (voucher_no): ตัวอักษร 'I' และ 'V' ที่เขียนติดกัน (เช่น IV6900249) มักโดน OCR มองผิดเป็นตัวอักษร 'N' (เช่น N6900249) ให้ตรวจสอบว่า Prefix เอกสารที่ถูกต้องคือ 'IV' (Invoice) หรือไม่
+2. ตรวจสอบพรีฟิกซ์เอกสารมาตรฐานทางบัญชี เช่น IV, INV, TAX, RE, RC, PV
+3. หากไม่พบยอด VAT ชัดเจน แต่เป็นใบกำกับภาษี ให้คำนวณ VAT = amount * 0.07 โดยประมาณ
+4. หากเป็นบริการ ให้ระบุ W/H Tax 3% หรือตามที่ระบุในเอกสาร
+5. ค่าที่เป็นตัวเลขให้ส่งเฉพาะตัวเลข float ห้ามใส่เครื่องหมายจุลภาค (,) หรือสัญลักษณ์สกุลเงิน
 """
+
+def clean_extracted_voucher_no(voucher_no: str) -> str:
+    """แก้ไขคำผิดพบบ่อยจากการอ่าน OCR ของเลขที่เอกสาร เช่น ตัวอักษร I กับ V ติดกันโดนอ่านเป็น N"""
+    if not voucher_no:
+        return ""
+    voucher_no = str(voucher_no).strip()
+    
+    # หากขึ้นต้นด้วย N ตามด้วยตัวเลขล้วน (เช่น N6900249, N-6900249) -> แก้เป็น IV (Invoice)
+    if re.match(r"^N[-_]?\d{4,}$", voucher_no, re.IGNORECASE):
+        voucher_no = re.sub(r"^N", "IV", voucher_no, flags=re.IGNORECASE)
+        
+    return voucher_no
 
 def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_key: str = None) -> Dict[str, Any]:
     """
@@ -42,12 +57,10 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
     models_to_try = ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.0-flash-lite"]
     last_error = None
 
-    # ลองใช้ SDK ของ Google Generative AI
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         
-        # หากเป็นรูปภาพ ใช้ PIL Image หรือ Dict Part
         part_content = {
             "mime_type": mime_type if mime_type else "image/jpeg",
             "data": file_bytes
@@ -68,8 +81,11 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                     
                 data = json.loads(text.strip())
                 
+                raw_vno = data.get("voucher_no", "")
+                clean_vno = clean_extracted_voucher_no(raw_vno)
+                
                 return {
-                    "voucher_no": data.get("voucher_no", ""),
+                    "voucher_no": clean_vno,
                     "date": data.get("date", ""),
                     "pay_to": data.get("pay_to", ""),
                     "items": [
@@ -127,8 +143,11 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                     text = text[:-3]
                     
                 data = json.loads(text.strip())
+                raw_vno = data.get("voucher_no", "")
+                clean_vno = clean_extracted_voucher_no(raw_vno)
+
                 return {
-                    "voucher_no": data.get("voucher_no", ""),
+                    "voucher_no": clean_vno,
                     "date": data.get("date", ""),
                     "pay_to": data.get("pay_to", ""),
                     "items": [
