@@ -3,6 +3,8 @@ import json
 import time
 import base64
 import re
+import urllib.request
+import urllib.error
 from typing import Dict, Any
 from dotenv import load_dotenv
 
@@ -53,7 +55,8 @@ def clean_extracted_voucher_no(voucher_no: str) -> str:
 
 def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_key: str = None) -> Dict[str, Any]:
     """
-    อ่านข้อมูลใบเสร็จจากรูปภาพหรือไฟล์ PDF โดยใช้ Gemini Vision API (gemini-flash-latest)
+    อ่านข้อมูลใบเสร็จจากรูปภาพหรือไฟล์ PDF โดยใช้ Gemini Vision API
+    พร้อมระบบอัตโนมัติรอ 7 วินาทีเมื่อติด Rate Limit (429) ก่อนลองใหม่อีกครั้ง
     """
     if not api_key:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -61,11 +64,12 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
     if not api_key:
         raise ValueError("กรุณากำหนด GEMINI_API_KEY ในระบบ หรือส่งผ่านอาร์กิวเมนต์")
 
-    # ใช้เฉพาะ gemini-flash-latest ซึ่งเปิดใช้งานได้จริงบน Free Tier และไม่ติด 404/429
     model_name = "gemini-flash-latest"
     last_error = None
 
-    for attempt in range(2):
+    # ลองใหม่สูงสุด 3 ครั้ง เมื่อติด Rate Limit (429)
+    for attempt in range(1, 4):
+        # 1. ลองผ่าน SDK google.generativeai
         try:
             import google.generativeai as genai
             genai.configure(api_key=api_key)
@@ -108,12 +112,11 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
             }
         except Exception as e:
             last_error = e
-            if "429" in str(e):
-                time.sleep(2)
+            if "429" in str(e) or "quota" in str(e).lower():
+                time.sleep(7)
                 continue
 
-        # HTTP REST Fallback (ใช้ gemini-flash-latest เท่านั้น)
-        import urllib.request
+        # 2. HTTP REST Fallback (ใช้ gemini-flash-latest)
         b64_data = base64.b64encode(file_bytes).decode('utf-8')
         
         try:
@@ -166,10 +169,15 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                     ],
                     "net_pay": float(data.get("net_pay", float(data.get("total", 0.0)) - float(data.get("wh_tax", 0.0))))
                 }
+        except urllib.error.HTTPError as e:
+            last_error = e
+            if e.code == 429:
+                time.sleep(7)
+                continue
         except Exception as e:
             last_error = e
             if "429" in str(e):
-                time.sleep(2)
+                time.sleep(7)
             continue
 
-    raise Exception(f"ไม่สามารถประมวลผลด้วย Gemini API ได้: {last_error}")
+    raise Exception(f"ขณะนี้โควต้าฟรีของ Gemini API เต็มชั่วคราว (Rate Limit 429) กรุณารอประมาณ 10 วินาทีแล้วลองส่งใหม่อีกครั้งครับ: {last_error}")
