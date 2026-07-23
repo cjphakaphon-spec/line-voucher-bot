@@ -1,7 +1,6 @@
 import os
 import uuid
 import json
-import zlib
 import base64
 import tempfile
 from dotenv import load_dotenv
@@ -41,21 +40,6 @@ BASE_URL = os.getenv("BASE_URL", "https://your-domain.ngrok-free.app") # URL ส
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-def encode_voucher_data(data: dict) -> str:
-    """บีบอัดข้อมูลด้วย zlib + Base64 เพื่อให้ URL สั้นที่สุด"""
-    raw = json.dumps(data, ensure_ascii=False).encode('utf-8')
-    compressed = zlib.compress(raw)
-    return base64.urlsafe_b64encode(compressed).decode('utf-8')
-
-def decode_voucher_data(d: str) -> dict:
-    """ถอดรหัสข้อมูล Voucher"""
-    compressed = base64.urlsafe_b64decode(d.encode('utf-8'))
-    try:
-        raw = zlib.decompress(compressed)
-        return json.loads(raw.decode('utf-8'))
-    except Exception:
-        return json.loads(compressed.decode('utf-8'))
-
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "Payment Voucher LINE Bot Server is running"}
@@ -74,12 +58,15 @@ def generate_and_download_pdf(d: str):
     (การันตีดาวน์โหลดได้สมบูรณ์ 100% บน Vercel Serverless โดยไม่ติดปัญหา 404 Not Found)
     """
     try:
-        data = decode_voucher_data(d)
+        # ถอดรหัส Base64 ข้อมูล Voucher
+        json_bytes = base64.urlsafe_b64decode(d.encode('utf-8'))
+        data = json.loads(json_bytes.decode('utf-8'))
         
         voucher_id = data.get("voucher_no", "VOUCHER")
         filename = f"{voucher_id}.pdf"
         filepath = os.path.join(OUTPUT_DIR, filename)
         
+        # สร้าง PDF เรียลไทม์
         create_payment_voucher_pdf(filepath, data)
         
         return FileResponse(filepath, media_type="application/pdf", filename=filename)
@@ -103,7 +90,6 @@ def handle_file_or_image_message(event):
     reply_token = event.reply_token
     message_id = event.message.id
     message_type = event.message.type
-    user_id = event.source.user_id
 
     mime_type = "image/jpeg"
     if message_type == "file":
@@ -122,26 +108,26 @@ def handle_file_or_image_message(event):
     )
 
     try:
-        # 1. ดึงไฟล์รูปภาพ/เอกสารจาก LINE API
+        # ดึงไฟล์รูปภาพ/เอกสารจาก LINE API
         message_content = line_bot_api.get_message_content(message_id)
         file_bytes = b""
         for chunk in message_content.iter_content():
             file_bytes += chunk
 
-        # 2. OCR ด้วย Gemini API (ใบเดียวสแกนจบ)
+        # 1. OCR ด้วย Gemini API
         extracted_data = extract_receipt_data(file_bytes, mime_type=mime_type)
 
-        # 3. กำหนดเลขที่เอกสาร
+        # 2. ใช้เลขที่เอกสาร/ใบเสร็จจริงที่ AI อ่านได้
         voucher_id = extracted_data.get("voucher_no")
         if not voucher_id or str(voucher_id).strip() in ["", "-", "None"]:
             voucher_id = f"PV-{uuid.uuid4().hex[:6].upper()}"
         extracted_data["voucher_no"] = voucher_id
 
-        # 4. สร้างลิงก์ดาวน์โหลด On-the-Fly
-        encoded_data = encode_voucher_data(extracted_data)
+        # 3. สร้างลิงก์ดาวน์โหลด On-the-Fly (รองรับ Vercel Serverless 100%)
+        encoded_data = base64.urlsafe_b64encode(json.dumps(extracted_data).encode('utf-8')).decode('utf-8')
         pdf_url = f"{BASE_URL.rstrip('/')}/pdf?d={encoded_data}"
 
-        # 5. ส่ง Flex Message การ์ดดาวน์โหลด PDF ให้ผู้ใช้ทันที
+        # 4. ส่ง Flex Message สรุปผล
         pay_to = extracted_data.get("pay_to", "-")
         net_pay = extracted_data.get("net_pay", 0.0)
 
@@ -175,11 +161,11 @@ def handle_file_or_image_message(event):
             )
         )
 
-        line_bot_api.push_message(user_id, flex_message)
+        line_bot_api.push_message(event.source.user_id, flex_message)
 
     except Exception as e:
         line_bot_api.push_message(
-            user_id,
+            event.source.user_id,
             TextSendMessage(text=f"❌ เกิดข้อผิดพลาดในการประมวลผลใบเสร็จ: {str(e)}")
         )
 

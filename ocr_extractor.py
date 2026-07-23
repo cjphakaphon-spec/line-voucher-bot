@@ -3,8 +3,6 @@ import json
 import time
 import base64
 import re
-import urllib.request
-import urllib.error
 from typing import Dict, Any
 from dotenv import load_dotenv
 
@@ -56,7 +54,6 @@ def clean_extracted_voucher_no(voucher_no: str) -> str:
 def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_key: str = None) -> Dict[str, Any]:
     """
     อ่านข้อมูลใบเสร็จจากรูปภาพหรือไฟล์ PDF โดยใช้ Gemini Vision API
-    พร้อมระบบ Retry อัตโนมัติและสลับโมเดลสำรองเมื่อติด Rate Limit (HTTP 429)
     """
     if not api_key:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -64,17 +61,10 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
     if not api_key:
         raise ValueError("กรุณากำหนด GEMINI_API_KEY ในระบบ หรือส่งผ่านอาร์กิวเมนต์")
 
-    models_to_try = [
-        "gemini-flash-latest",
-        "gemini-1.5-flash-latest",
-        "gemini-2.0-flash-lite",
-        "gemini-pro-latest"
-    ]
-    
+    models_to_try = ["gemini-flash-latest", "gemini-1.5-flash"]
     last_error = None
 
-    # ลองทำซ้ำสูงสุด 3 รอบเผื่อกรณีโดนจำกัด Rate Limit ชั่วคราว
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             import google.generativeai as genai
             genai.configure(api_key=api_key)
@@ -98,7 +88,6 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                         text = text[:-3]
                         
                     data = json.loads(text.strip())
-                    
                     raw_vno = data.get("voucher_no", "")
                     clean_vno = clean_extracted_voucher_no(raw_vno)
                     
@@ -123,11 +112,11 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                     if "429" in str(e):
                         time.sleep(2)
                     continue
-                    
         except ImportError:
             pass
-            
+
         # HTTP REST Fallback
+        import urllib.request
         b64_data = base64.b64encode(file_bytes).decode('utf-8')
         
         for model_name in models_to_try:
@@ -181,15 +170,10 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                         ],
                         "net_pay": float(data.get("net_pay", float(data.get("total", 0.0)) - float(data.get("wh_tax", 0.0))))
                     }
-            except urllib.error.HTTPError as e:
-                last_error = e
-                if e.code == 429:
-                    time.sleep(2)
-                continue
             except Exception as e:
                 last_error = e
+                if "429" in str(e):
+                    time.sleep(2)
                 continue
 
-        time.sleep(2) # รอ 2 วินาทีก่อนลองรอบถัดไป
-
-    raise Exception(f"ไม่สามารถประมวลผลด้วย Gemini API ได้ (ติด Rate Limit 429 ชั่วคราว): {last_error}")
+    raise Exception(f"ไม่สามารถประมวลผลด้วย Gemini API ได้: {last_error}")
