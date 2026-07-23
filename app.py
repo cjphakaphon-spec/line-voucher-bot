@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import zlib
 import base64
 import tempfile
 from dotenv import load_dotenv
@@ -12,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
     MessageEvent, ImageMessage, FileMessage, TextMessage, TextSendMessage, FlexSendMessage,
     QuickReply, QuickReplyButton, MessageAction,
@@ -40,6 +41,21 @@ BASE_URL = os.getenv("BASE_URL", "https://your-domain.ngrok-free.app") # URL ส
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# --- ฟังก์ชันย่อ/ถอดรหัสข้อมูล Voucher สั้นพิเศษเพื่อไม่ให้เกินความยาวของ LINE URI Limit ---
+def encode_voucher_data(data: dict) -> str:
+    raw = json.dumps(data, ensure_ascii=False).encode('utf-8')
+    compressed = zlib.compress(raw)
+    return base64.urlsafe_b64encode(compressed).decode('utf-8')
+
+def decode_voucher_data(d: str) -> dict:
+    compressed = base64.urlsafe_b64decode(d.encode('utf-8'))
+    try:
+        raw = zlib.decompress(compressed)
+        return json.loads(raw.decode('utf-8'))
+    except Exception:
+        # Fallback กรณีข้อความเก่าเป็น Base64 ธรรมดาที่ไม่ผ่าน zlib
+        return json.loads(compressed.decode('utf-8'))
 
 # --- ระบบจัดการ Session รายการสะสมของผู้ใช้ ---
 def get_user_session_path(user_id: str) -> str:
@@ -86,8 +102,7 @@ def generate_and_download_pdf(d: str):
     (การันตีดาวน์โหลดได้สมบูรณ์ 100% บน Vercel Serverless โดยไม่ติดปัญหา 404 Not Found)
     """
     try:
-        json_bytes = base64.urlsafe_b64decode(d.encode('utf-8'))
-        data = json.loads(json_bytes.decode('utf-8'))
+        data = decode_voucher_data(d)
         
         voucher_id = data.get("voucher_no", "VOUCHER")
         filename = f"{voucher_id}.pdf"
@@ -192,7 +207,6 @@ def handle_text_message(event):
     user_text = event.message.text.strip().lower()
 
     try:
-        # ตรวจจับคำสั่งสร้าง PDF ออกใบสำคัญจ่าย
         finish_keywords = [
             "ออก pdf", "ออกpdf", "สร้าง pdf", "สร้างpdf", "pdf",
             "สิ้นสุดรายการ", "สิ้นสุด", "ใช่", "เสร็จแล้ว", "เสร็จ",
@@ -224,7 +238,8 @@ def handle_text_message(event):
                 "net_pay": sum(item.get("total", 0.0) for item in items)
             }
 
-            encoded_data = base64.urlsafe_b64encode(json.dumps(combined_data).encode('utf-8')).decode('utf-8')
+            # บีบอัดข้อมูลด้วย zlib + Base64 เพื่อให้ URL สั้นไม่เกินข้อกำหนด 1,000 ตัวอักษรของ LINE URI Limit
+            encoded_data = encode_voucher_data(combined_data)
             pdf_url = f"{BASE_URL.rstrip('/')}/pdf?d={encoded_data}"
 
             pay_to = combined_data.get("pay_to", "-")
@@ -261,7 +276,8 @@ def handle_text_message(event):
                 )
             )
 
-            line_bot_api.reply_message(event.reply_token, flex_message)
+            # ใช้ push_message เพื่อป้องกัน reply_token หมดอายุหากเกิดความผิดพลาด
+            line_bot_api.push_message(user_id, flex_message)
             clear_user_session(user_id)
 
         elif any(kw in user_text for kw in ["เพิ่มรายการอีก", "เพิ่มรายการ", "ไม่", "ยัง"]):
@@ -280,8 +296,8 @@ def handle_text_message(event):
             )
 
     except Exception as e:
-        line_bot_api.reply_message(
-            event.reply_token,
+        line_bot_api.push_message(
+            user_id,
             TextSendMessage(text=f"❌ เกิดข้อผิดพลาดในการสร้าง PDF: {str(e)}")
         )
 
