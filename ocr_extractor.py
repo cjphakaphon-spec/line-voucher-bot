@@ -1,7 +1,10 @@
 import os
 import json
+import time
 import base64
 import re
+import urllib.request
+import urllib.error
 from typing import Dict, Any
 from dotenv import load_dotenv
 
@@ -42,12 +45,9 @@ def clean_extracted_voucher_no(voucher_no: str) -> str:
         return ""
     voucher_no = str(voucher_no).strip()
     
-    # 1. ป้องกัน (Safeguard): หากเป็น Prefix N ที่มีคำหรือสัญลักษณ์ชัดเจน ให้คงไว้ตามจริง ไม่เปลี่ยนเป็น IV
-    # เช่น NOTE-001, NO.1234, N-690, N_123, NET-01
     if re.match(r"^(NOTE|NO|DN|NET|NOTICE|NUMBER|N[-_])", voucher_no, re.IGNORECASE):
         return voucher_no
 
-    # 2. แก้ไขเฉพาะกรณี N ตามด้วยตัวเลขติดกันยาวๆ 5 หลักขึ้นไป (เช่น N6900249) ที่มักเกิดจาก OCR อ่านตัว IV ติดกันผิด
     if re.match(r"^N\d{5,}$", voucher_no):
         voucher_no = re.sub(r"^N", "IV", voucher_no)
         
@@ -55,7 +55,8 @@ def clean_extracted_voucher_no(voucher_no: str) -> str:
 
 def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_key: str = None) -> Dict[str, Any]:
     """
-    อ่านข้อมูลใบเสร็จจากรูปภาพหรือไฟล์ PDF โดยใช้ Gemini Vision API พร้อมระบบโมเดลสำรอง
+    อ่านข้อมูลใบเสร็จจากรูปภาพหรือไฟล์ PDF โดยใช้ Gemini Vision API
+    พร้อมระบบ Retry อัตโนมัติและสลับโมเดลสำรองเมื่อติด Rate Limit (HTTP 429)
     """
     if not api_key:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -63,116 +64,132 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
     if not api_key:
         raise ValueError("กรุณากำหนด GEMINI_API_KEY ในระบบ หรือส่งผ่านอาร์กิวเมนต์")
 
-    models_to_try = ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.0-flash-lite"]
+    models_to_try = [
+        "gemini-flash-latest",
+        "gemini-1.5-flash-latest",
+        "gemini-2.0-flash-lite",
+        "gemini-pro-latest"
+    ]
+    
     last_error = None
 
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        
-        part_content = {
-            "mime_type": mime_type if mime_type else "image/jpeg",
-            "data": file_bytes
-        }
+    # ลองทำซ้ำสูงสุด 3 รอบเผื่อกรณีโดนจำกัด Rate Limit ชั่วคราว
+    for attempt in range(3):
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            
+            part_content = {
+                "mime_type": mime_type if mime_type else "image/jpeg",
+                "data": file_bytes
+            }
 
+            for model_name in models_to_try:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content([PROMPT_EXTRACT_RECEIPT, part_content])
+                    text = response.text.strip()
+                    
+                    if text.startswith("```json"):
+                        text = text[7:]
+                    if text.startswith("```"):
+                        text = text[3:]
+                    if text.endswith("```"):
+                        text = text[:-3]
+                        
+                    data = json.loads(text.strip())
+                    
+                    raw_vno = data.get("voucher_no", "")
+                    clean_vno = clean_extracted_voucher_no(raw_vno)
+                    
+                    return {
+                        "voucher_no": clean_vno,
+                        "date": data.get("date", ""),
+                        "pay_to": data.get("pay_to", ""),
+                        "items": [
+                            {
+                                "date": data.get("date", ""),
+                                "particulars": data.get("particulars", "ชำระค่าสินค้า/บริการ ตามใบเสร็จ"),
+                                "amount": float(data.get("amount", 0.0)),
+                                "vat": float(data.get("vat", 0.0)),
+                                "wh_tax": float(data.get("wh_tax", 0.0)),
+                                "total": float(data.get("total", 0.0))
+                            }
+                        ],
+                        "net_pay": float(data.get("net_pay", float(data.get("total", 0.0)) - float(data.get("wh_tax", 0.0))))
+                    }
+                except Exception as e:
+                    last_error = e
+                    if "429" in str(e):
+                        time.sleep(2)
+                    continue
+                    
+        except ImportError:
+            pass
+            
+        # HTTP REST Fallback
+        b64_data = base64.b64encode(file_bytes).decode('utf-8')
+        
         for model_name in models_to_try:
             try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content([PROMPT_EXTRACT_RECEIPT, part_content])
-                text = response.text.strip()
-                
-                if text.startswith("```json"):
-                    text = text[7:]
-                if text.startswith("```"):
-                    text = text[3:]
-                if text.endswith("```"):
-                    text = text[:-3]
-                    
-                data = json.loads(text.strip())
-                
-                raw_vno = data.get("voucher_no", "")
-                clean_vno = clean_extracted_voucher_no(raw_vno)
-                
-                return {
-                    "voucher_no": clean_vno,
-                    "date": data.get("date", ""),
-                    "pay_to": data.get("pay_to", ""),
-                    "items": [
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                headers = {'Content-Type': 'application/json'}
+                payload = {
+                    "contents": [
                         {
-                            "date": data.get("date", ""),
-                            "particulars": data.get("particulars", "ชำระค่าสินค้า/บริการ ตามใบเสร็จ"),
-                            "amount": float(data.get("amount", 0.0)),
-                            "vat": float(data.get("vat", 0.0)),
-                            "wh_tax": float(data.get("wh_tax", 0.0)),
-                            "total": float(data.get("total", 0.0))
+                            "parts": [
+                                {"text": PROMPT_EXTRACT_RECEIPT},
+                                {
+                                    "inline_data": {
+                                        "mime_type": mime_type if mime_type else "image/jpeg",
+                                        "data": b64_data
+                                    }
+                                }
+                            ]
                         }
-                    ],
-                    "net_pay": float(data.get("net_pay", float(data.get("total", 0.0)) - float(data.get("wh_tax", 0.0))))
+                    ]
                 }
+                req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
+                with urllib.request.urlopen(req) as resp:
+                    res_json = json.loads(resp.read().decode('utf-8'))
+                    text = res_json['candidates'][0]['content']['parts'][0]['text'].strip()
+                    
+                    if text.startswith("```json"):
+                        text = text[7:]
+                    if text.startswith("```"):
+                        text = text[3:]
+                    if text.endswith("```"):
+                        text = text[:-3]
+                        
+                    data = json.loads(text.strip())
+                    raw_vno = data.get("voucher_no", "")
+                    clean_vno = clean_extracted_voucher_no(raw_vno)
+
+                    return {
+                        "voucher_no": clean_vno,
+                        "date": data.get("date", ""),
+                        "pay_to": data.get("pay_to", ""),
+                        "items": [
+                            {
+                                "date": data.get("date", ""),
+                                "particulars": data.get("particulars", "ชำระค่าสินค้า/บริการ"),
+                                "amount": float(data.get("amount", 0.0)),
+                                "vat": float(data.get("vat", 0.0)),
+                                "wh_tax": float(data.get("wh_tax", 0.0)),
+                                "total": float(data.get("total", 0.0))
+                            }
+                        ],
+                        "net_pay": float(data.get("net_pay", float(data.get("total", 0.0)) - float(data.get("wh_tax", 0.0))))
+                    }
+            except urllib.error.HTTPError as e:
+                last_error = e
+                if e.code == 429:
+                    time.sleep(2)
+                continue
             except Exception as e:
                 last_error = e
                 continue
-                
-    except ImportError:
-        pass
-        
-    # HTTP REST Fallback
-    import urllib.request
-    b64_data = base64.b64encode(file_bytes).decode('utf-8')
-    
-    for model_name in models_to_try:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-            headers = {'Content-Type': 'application/json'}
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": PROMPT_EXTRACT_RECEIPT},
-                            {
-                                "inline_data": {
-                                    "mime_type": mime_type if mime_type else "image/jpeg",
-                                    "data": b64_data
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-            req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
-            with urllib.request.urlopen(req) as resp:
-                res_json = json.loads(resp.read().decode('utf-8'))
-                text = res_json['candidates'][0]['content']['parts'][0]['text'].strip()
-                
-                if text.startswith("```json"):
-                    text = text[7:]
-                if text.startswith("```"):
-                    text = text[3:]
-                if text.endswith("```"):
-                    text = text[:-3]
-                    
-                data = json.loads(text.strip())
-                raw_vno = data.get("voucher_no", "")
-                clean_vno = clean_extracted_voucher_no(raw_vno)
 
-                return {
-                    "voucher_no": clean_vno,
-                    "date": data.get("date", ""),
-                    "pay_to": data.get("pay_to", ""),
-                    "items": [
-                        {
-                            "date": data.get("date", ""),
-                            "particulars": data.get("particulars", "ชำระค่าสินค้า/บริการ"),
-                            "amount": float(data.get("amount", 0.0)),
-                            "vat": float(data.get("vat", 0.0)),
-                            "wh_tax": float(data.get("wh_tax", 0.0)),
-                            "total": float(data.get("total", 0.0))
-                        }
-                    ],
-                    "net_pay": float(data.get("net_pay", float(data.get("total", 0.0)) - float(data.get("wh_tax", 0.0))))
-                }
-        except Exception as e:
-            last_error = e
-            continue
+        time.sleep(2) # รอ 2 วินาทีก่อนลองรอบถัดไป
 
-    raise Exception(f"ไม่สามารถประมวลผลด้วย Gemini API ได้: {last_error}")
+    raise Exception(f"ไม่สามารถประมวลผลด้วย Gemini API ได้ (ติด Rate Limit 429 ชั่วคราว): {last_error}")
