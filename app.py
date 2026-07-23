@@ -128,23 +128,19 @@ def handle_file_or_image_message(event):
         elif file_name.endswith(".jpg") or file_name.endswith(".jpeg"):
             mime_type = "image/jpeg"
 
-    # แจ้งเตือนผู้ใช้ว่ากำลังประมวลผล
     line_bot_api.reply_message(
         reply_token,
         TextSendMessage(text="⏳ กำลังอ่านข้อมูลใบเสร็จด้วย AI กรุณารอสักครู่ครับ...")
     )
 
     try:
-        # 1. ดึงไฟล์รูปภาพ/เอกสารจาก LINE API
         message_content = line_bot_api.get_message_content(message_id)
         file_bytes = b""
         for chunk in message_content.iter_content():
             file_bytes += chunk
 
-        # 2. OCR ด้วย Gemini API
         extracted_data = extract_receipt_data(file_bytes, mime_type=mime_type)
 
-        # 3. สะสมรายการเข้าใน Session ของผู้ใช้
         session = load_user_session(user_id)
         new_item = extracted_data.get("items", [{}])[0]
         session["items"].append(new_item)
@@ -163,7 +159,6 @@ def handle_file_or_image_message(event):
         last_item_net = new_item.get("total", 0.0)
         total_accumulated = sum(item.get("total", 0.0) for item in session["items"])
 
-        # 4. ส่งข้อความสรุปรายการสะสม พร้อม Quick Reply ให้ผู้ใช้เลือกว่าจะเพิ่มอีก หรือ สิ้นสุดสร้าง PDF
         reply_text = (
             f"📥 บันทึกรายการที่ {count} เรียบร้อยแล้ว!\n"
             f"• รายการ: {last_item_text}\n"
@@ -174,7 +169,7 @@ def handle_file_or_image_message(event):
 
         quick_reply = QuickReply(
             items=[
-                QuickReplyButton(action=MessageAction(label="✅ ออก PDF (สิ้นสุด)", text="สร้าง PDF")),
+                QuickReplyButton(action=MessageAction(label="✅ ออก PDF (สิ้นสุด)", text="ออก PDF")),
                 QuickReplyButton(action=MessageAction(label="➕ เพิ่มรายการอีก", text="เพิ่มรายการอีก")),
                 QuickReplyButton(action=MessageAction(label="🔄 ยกเลิกรายการ", text="ยกเลิก"))
             ]
@@ -196,84 +191,98 @@ def handle_text_message(event):
     user_id = event.source.user_id
     user_text = event.message.text.strip().lower()
 
-    if user_text in ["สร้าง pdf", "สร้างpdf", "สิ้นสุดรายการ", "ใช่", "เสร็จแล้ว", "เสร็จ", "ออกใบสำคัญจ่าย"]:
-        session = load_user_session(user_id)
-        items = session.get("items", [])
+    try:
+        # ตรวจจับคำสั่งสร้าง PDF ออกใบสำคัญจ่าย
+        finish_keywords = [
+            "ออก pdf", "ออกpdf", "สร้าง pdf", "สร้างpdf", "pdf",
+            "สิ้นสุดรายการ", "สิ้นสุด", "ใช่", "เสร็จแล้ว", "เสร็จ",
+            "ออกใบสำคัญจ่าย", "ออก pdf (สิ้นสุด)"
+        ]
+        
+        is_finish = any(kw in user_text for kw in finish_keywords) or user_text.startswith("ออก") or user_text.startswith("สร้าง")
 
-        if not items:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="⚠️ ยังไม่มีรายการใบเสร็จสะสมในระบบ กรุณาถ่ายรูปหรือส่งไฟล์ใบเสร็จเข้ามาก่อนครับ")
-            )
-            return
+        if is_finish:
+            session = load_user_session(user_id)
+            items = session.get("items", [])
 
-        # สร้างเลขที่ Voucher หากไม่มี
-        voucher_id = session.get("voucher_no")
-        if not voucher_id or str(voucher_id).strip() in ["", "-", "None"]:
-            voucher_id = f"PV-{uuid.uuid4().hex[:6].upper()}"
+            if not items:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="⚠️ ยังไม่มีรายการใบเสร็จสะสมในระบบ กรุณาถ่ายรูปหรือส่งไฟล์ใบเสร็จเข้ามาก่อนครับ")
+                )
+                return
 
-        combined_data = {
-            "voucher_no": voucher_id,
-            "date": session.get("date", ""),
-            "pay_to": session.get("pay_to", ""),
-            "items": items,
-            "net_pay": sum(item.get("total", 0.0) for item in items)
-        }
+            voucher_id = session.get("voucher_no")
+            if not voucher_id or str(voucher_id).strip() in ["", "-", "None"]:
+                voucher_id = f"PV-{uuid.uuid4().hex[:6].upper()}"
 
-        # สร้างลิงก์ดาวน์โหลด On-the-Fly (รองรับ Vercel Serverless 100%)
-        encoded_data = base64.urlsafe_b64encode(json.dumps(combined_data).encode('utf-8')).decode('utf-8')
-        pdf_url = f"{BASE_URL.rstrip('/')}/pdf?d={encoded_data}"
+            combined_data = {
+                "voucher_no": voucher_id,
+                "date": session.get("date", ""),
+                "pay_to": session.get("pay_to", ""),
+                "items": items,
+                "net_pay": sum(item.get("total", 0.0) for item in items)
+            }
 
-        pay_to = combined_data.get("pay_to", "-")
-        net_pay = combined_data.get("net_pay", 0.0)
-        item_count = len(items)
+            encoded_data = base64.urlsafe_b64encode(json.dumps(combined_data).encode('utf-8')).decode('utf-8')
+            pdf_url = f"{BASE_URL.rstrip('/')}/pdf?d={encoded_data}"
 
-        flex_message = FlexSendMessage(
-            alt_text=f"สร้าง Payment Voucher {voucher_id} ({item_count} รายการ) สำเร็จแล้ว",
-            contents=BubbleContainer(
-                header=BoxComponent(
-                    layout="vertical",
-                    contents=[
-                        TextComponent(text="✅ สร้าง Payment Voucher สำเร็จ", weight="bold", color="#1DB446", size="md"),
-                        TextComponent(text=f"เลขที่: {voucher_id} ({item_count} รายการ)", size="xs", color="#aaaaaa")
-                    ]
-                ),
-                body=BoxComponent(
-                    layout="vertical",
-                    contents=[
-                        TextComponent(text=f"จ่ายให้: {pay_to}", weight="bold", size="sm"),
-                        TextComponent(text=f"ยอดจ่ายสุทธิรวม: {net_pay:,.2f} THB", size="lg", weight="bold", color="#111111")
-                    ]
-                ),
-                footer=BoxComponent(
-                    layout="vertical",
-                    contents=[
-                        ButtonComponent(
-                            action=URIAction(label="📄 ดาวน์โหลด PDF Voucher", uri=pdf_url),
-                            style="primary",
-                            color="#0066CC"
-                        )
-                    ]
+            pay_to = combined_data.get("pay_to", "-")
+            net_pay = combined_data.get("net_pay", 0.0)
+            item_count = len(items)
+
+            flex_message = FlexSendMessage(
+                alt_text=f"สร้าง Payment Voucher {voucher_id} ({item_count} รายการ) สำเร็จแล้ว",
+                contents=BubbleContainer(
+                    header=BoxComponent(
+                        layout="vertical",
+                        contents=[
+                            TextComponent(text="✅ สร้าง Payment Voucher สำเร็จ", weight="bold", color="#1DB446", size="md"),
+                            TextComponent(text=f"เลขที่: {voucher_id} ({item_count} รายการ)", size="xs", color="#aaaaaa")
+                        ]
+                    ),
+                    body=BoxComponent(
+                        layout="vertical",
+                        contents=[
+                            TextComponent(text=f"จ่ายให้: {pay_to}", weight="bold", size="sm"),
+                            TextComponent(text=f"ยอดจ่ายสุทธิรวม: {net_pay:,.2f} THB", size="lg", weight="bold", color="#111111")
+                        ]
+                    ),
+                    footer=BoxComponent(
+                        layout="vertical",
+                        contents=[
+                            ButtonComponent(
+                                action=URIAction(label="📄 ดาวน์โหลด PDF Voucher", uri=pdf_url),
+                                style="primary",
+                                color="#0066CC"
+                            )
+                        ]
+                    )
                 )
             )
-        )
 
-        line_bot_api.reply_message(event.reply_token, flex_message)
-        clear_user_session(user_id)
+            line_bot_api.reply_message(event.reply_token, flex_message)
+            clear_user_session(user_id)
 
-    elif user_text in ["เพิ่มรายการอีก", "เพิ่มรายการ", "ไม่", "ยัง"]:
-        session = load_user_session(user_id)
-        count = len(session.get("items", []))
+        elif any(kw in user_text for kw in ["เพิ่มรายการอีก", "เพิ่มรายการ", "ไม่", "ยัง"]):
+            session = load_user_session(user_id)
+            count = len(session.get("items", []))
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"📸 รับทราบครับ (ขณะนี้สะสมอยู่ {count} รายการ)\n\nกรุณาถ่ายรูปหรือส่งไฟล์ใบเสร็จใบถัดไปมาได้เลยครับ ระบบจะนำไปใส่ในบรรทัดที่ {count + 1} ให้ทันที")
+            )
+
+        elif any(kw in user_text for kw in ["ยกเลิก", "เริ่มใหม่", "ลบ", "reset"]):
+            clear_user_session(user_id)
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="🔄 ยกเลิกรายการสะสมเรียบร้อยแล้วครับ สามารถถ่ายรูปหรือส่งไฟล์ใบเสร็จเพื่อเริ่มใหม่ได้ทันที")
+            )
+
+    except Exception as e:
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text=f"📸 รับทราบครับ (ขณะนี้สะสมอยู่ {count} รายการ)\n\nกรุณาถ่ายรูปหรือส่งไฟล์ใบเสร็จใบถัดไปมาได้เลยครับ ระบบจะนำไปใส่ในบรรทัดที่ {count + 1} ให้ทันที")
-        )
-
-    elif user_text in ["ยกเลิก", "เริ่มใหม่", "ลบ", "reset"]:
-        clear_user_session(user_id)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="🔄 ยกเลิกรายการสะสมเรียบร้อยแล้วครับ สามารถถ่ายรูปหรือส่งไฟล์ใบเสร็จเพื่อเริ่มใหม่ได้ทันที")
+            TextSendMessage(text=f"❌ เกิดข้อผิดพลาดในการสร้าง PDF: {str(e)}")
         )
 
 if __name__ == "__main__":
