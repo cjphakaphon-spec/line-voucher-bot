@@ -13,7 +13,7 @@ load_dotenv()
 PROMPT_EXTRACT_RECEIPT = """
 คุณคือผู้เชี่ยวชาญด้านการบัญชีและการอ่านเอกสารใบเสร็จ/ใบกำกับภาษีภาษาไทยและอังกฤษ
 
-กรุณาวิเคราะห์เอกสารใบเสร็จ/ใบกำกับภาษีที่แนบมานี้ (ทั้งรูปภาพและไฟล์ PDF) แล้วสกัดข้อมูลลงในรูปแบบ JSON ต่อไปนี้เท่านั้น (ไม่ต้องมีคำอธิบายเพิ่มเติม นอกเหนือจาก JSON):
+กรุณาวิเคราะห์เอกสารใบเสร็จ/ใบกำกับภาษีที่แนบมานี้ (ทั้งรูปภาพและไฟล์ PDF) สังเกตทั้งตัวอักษรพิมพ์และข้อความโน้ตที่เขียนด้วยลายมือบนรูปภาพ แล้วสกัดข้อมูลลงในรูปแบบ JSON ต่อไปนี้เท่านั้น (ไม่ต้องมีคำอธิบายเพิ่มเติม นอกเหนือจาก JSON):
 
 {
   "pay_to": "ชื่อบริษัท/ผู้ขาย/ซัพพลายเออร์ที่ออกใบเสร็จ (Pay to)",
@@ -22,18 +22,22 @@ PROMPT_EXTRACT_RECEIPT = """
   "particulars": "สรุปรายการสินค้า/บริการ หรือชื่อรายการหลัก",
   "amount": ยอดเงินก่อน VAT (ตัวเลข float เช่น 1000.00),
   "vat": ยอดภาษีมูลค่าเพิ่ม 7% (ตัวเลข float เช่น 70.00 ถ้าไม่มีให้ใส่ 0.00),
-  "wh_tax": ยอดภาษีหัก ณ ที่จ่าย (ตัวเลข float ถ้าไม่มีให้ใส่ 0.00),
+  "wh_tax": ยอดภาษีหัก ณ ที่จ่าย (ตัวเลข float เช่น 30.00 ถ้าไม่มีให้ใส่ 0.00),
   "total": ยอดเงินรวมก่อนหัก ณ ที่จ่าย (ตัวเลข float เช่น 1070.00),
-  "net_pay": ยอดเงินจ่ายจริง/สุทธิ (ตัวเลข float เช่น 1040.00)
+  "net_pay": ยอดเงินจ่ายจริง/สุทธิ หลังหัก ณ ที่จ่าย (ตัวเลข float เช่น 1040.00)
 }
 
-กฎเพิ่มเติมสำหรับการระบุเลขที่เอกสาร (voucher_no):
-1. การระวังแยกแยะตัวอักษร IV กับ N:
+กฎเพิ่มเติมสำหรับการประมวลผลข้อมูลและโน้ตลายมือ:
+1. การตรวจจับโน้ตลายมือ (Handwritten Notes):
+   - สังเกตข้อความลายมือหรือโน้ตที่เขียนเพิ่มเติมบนเอกสาร หากมีข้อความระบุเกี่ยวกับการหัก ณ ที่จ่าย (เช่น "หัก ณ ที่จ่าย 3%", "หัก 3%", "W/H 3%", หรือระบุยอดตัวเลขหัก ณ ที่จ่าย) ให้สกัดค่านั้นลงในช่อง `wh_tax`
+   - หากระบุเป็นเปอร์เซ็นต์ (เช่น หัก 3% หรือ 1%) ให้คำนวณยอด `wh_tax` จากยอดเงินก่อน VAT (`amount`) ตัวอย่างเช่น: ยอดก่อน VAT = 1,000 บาท หัก 3% จะได้ `wh_tax = 30.00`
+2. การคำนวณยอดเงิน:
+   - ยอดรวมก่อนหัก ณ ที่จ่าย (`total`) = ยอดก่อน VAT (`amount`) + ภาษีมูลค่าเพิ่ม (`vat`)
+   - ยอดเงินจ่ายจริง (`net_pay`) = ยอดรวม (`total`) - ภาษีหัก ณ ที่จ่าย (`wh_tax`)
+3. การระวังแยกแยะตัวอักษร IV กับ N ของเลขที่เอกสาร (voucher_no):
    - หากเป็นเอกสารประเภท ใบกำกับภาษี / ใบแจ้งหนี้ (Tax Invoice / Invoice) แล้วพบรหัสขึ้นต้นด้วย N ตามด้วยตัวเลขชิดกัน (เช่น N6900249) ให้สังเกตขีดและเส้นของตัวอักษรอย่างละเอียด หากต้นฉบับคือ IV (Invoice) ให้คืนค่าเป็น "IV6900249"
    - หากเอกสารนั้นมี Prefix ตัว N จริงๆ หรือเป็นเอกสารประเภท Note / Delivery Note / Form N ให้คงค่า "N..." ไว้ตามต้นฉบับจริง ห้ามเปลี่ยนเป็น IV
-2. ตรวจสอบพรีฟิกซ์เอกสารมาตรฐานทางบัญชี เช่น IV, INV, TAX, RE, RC, PV, NO, NOTE, DN
-3. หากไม่พบยอด VAT ชัดเจน แต่เป็นใบกำกับภาษี ให้คำนวณ VAT = amount * 0.07 โดยประมาณ
-4. หากเป็นบริการ ให้ระบุ W/H Tax 3% หรือตามที่ระบุในเอกสาร
+4. ตรวจสอบพรีฟิกซ์เอกสารมาตรฐานทางบัญชี เช่น IV, INV, TAX, RE, RC, PV, NO, NOTE, DN
 5. ค่าที่เป็นตัวเลขให้ส่งเฉพาะตัวเลข float ห้ามใส่เครื่องหมายจุลภาค (,) หรือสัญลักษณ์สกุลเงิน
 """
 
@@ -56,7 +60,7 @@ def clean_extracted_voucher_no(voucher_no: str) -> str:
 def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_key: str = None) -> Dict[str, Any]:
     """
     อ่านข้อมูลใบเสร็จจากรูปภาพหรือไฟล์ PDF โดยใช้ Gemini Vision API
-    ใช้ gemini-flash-lite-latest ซึ่งเบา ฟรี และมีโควต้าฟรีพร้อมใช้งาน ไม่ติด Rate Limit
+    รองรับการอ่านโน้ตลายมือ การคำนวณหัก ณ ที่จ่าย และคำนวณยอดสุทธอัตโนมัติ
     """
     if not api_key:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -64,7 +68,6 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
     if not api_key:
         raise ValueError("กรุณากำหนด GEMINI_API_KEY ในระบบ หรือส่งผ่านอาร์กิวเมนต์")
 
-    # โมเดลเรียงตามลำดับความเบาและโควต้าฟรีที่ใช้งานได้จริง
     models_to_try = ["gemini-flash-lite-latest", "gemini-flash-latest"]
     last_error = None
 
@@ -96,6 +99,12 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                     raw_vno = data.get("voucher_no", "")
                     clean_vno = clean_extracted_voucher_no(raw_vno)
                     
+                    amount = float(data.get("amount", 0.0))
+                    vat = float(data.get("vat", 0.0))
+                    wh_tax = float(data.get("wh_tax", 0.0))
+                    total = float(data.get("total", amount + vat))
+                    net_pay = float(data.get("net_pay", total - wh_tax))
+                    
                     return {
                         "voucher_no": clean_vno,
                         "date": data.get("date", ""),
@@ -104,13 +113,13 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                             {
                                 "date": data.get("date", ""),
                                 "particulars": data.get("particulars", "ชำระค่าสินค้า/บริการ ตามใบเสร็จ"),
-                                "amount": float(data.get("amount", 0.0)),
-                                "vat": float(data.get("vat", 0.0)),
-                                "wh_tax": float(data.get("wh_tax", 0.0)),
-                                "total": float(data.get("total", 0.0))
+                                "amount": amount,
+                                "vat": vat,
+                                "wh_tax": wh_tax,
+                                "total": total
                             }
                         ],
-                        "net_pay": float(data.get("net_pay", float(data.get("total", 0.0)) - float(data.get("wh_tax", 0.0))))
+                        "net_pay": net_pay
                     }
                 except Exception as e:
                     last_error = e
@@ -156,6 +165,12 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                     raw_vno = data.get("voucher_no", "")
                     clean_vno = clean_extracted_voucher_no(raw_vno)
 
+                    amount = float(data.get("amount", 0.0))
+                    vat = float(data.get("vat", 0.0))
+                    wh_tax = float(data.get("wh_tax", 0.0))
+                    total = float(data.get("total", amount + vat))
+                    net_pay = float(data.get("net_pay", total - wh_tax))
+
                     return {
                         "voucher_no": clean_vno,
                         "date": data.get("date", ""),
@@ -164,13 +179,13 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                             {
                                 "date": data.get("date", ""),
                                 "particulars": data.get("particulars", "ชำระค่าสินค้า/บริการ"),
-                                "amount": float(data.get("amount", 0.0)),
-                                "vat": float(data.get("vat", 0.0)),
-                                "wh_tax": float(data.get("wh_tax", 0.0)),
-                                "total": float(data.get("total", 0.0))
+                                "amount": amount,
+                                "vat": vat,
+                                "wh_tax": wh_tax,
+                                "total": total
                             }
                         ],
-                        "net_pay": float(data.get("net_pay", float(data.get("total", 0.0)) - float(data.get("wh_tax", 0.0))))
+                        "net_pay": net_pay
                     }
             except Exception as e:
                 last_error = e
