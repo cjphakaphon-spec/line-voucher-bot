@@ -174,9 +174,9 @@ def handle_file_or_image_message(event):
 
         quick_reply = QuickReply(
             items=[
-                QuickReplyButton(action=MessageAction(label="✅ สิ้นสุดรายการ (สร้าง PDF)", text="สร้าง PDF")),
+                QuickReplyButton(action=MessageAction(label="✅ ออก PDF (สิ้นสุด)", text="สร้าง PDF")),
                 QuickReplyButton(action=MessageAction(label="➕ เพิ่มรายการอีก", text="เพิ่มรายการอีก")),
-                QuickReplyButton(action=MessageAction(label="🔄 ยกเลิก/เริ่มใหม่", text="ยกเลิก"))
+                QuickReplyButton(action=MessageAction(label="🔄 ยกเลิกรายการ", text="ยกเลิก"))
             ]
         )
 
