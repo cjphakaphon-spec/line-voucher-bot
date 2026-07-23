@@ -1,6 +1,8 @@
 import os
+import re
 import uuid
 import json
+import zlib
 import base64
 import tempfile
 from dotenv import load_dotenv
@@ -40,6 +42,21 @@ BASE_URL = os.getenv("BASE_URL", "https://your-domain.ngrok-free.app") # URL ส
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+def encode_voucher_data(data: dict) -> str:
+    """บีบอัดข้อมูลด้วย zlib + Base64 เพื่อความปลอดภัยและ URL สั้นลง"""
+    raw = json.dumps(data, ensure_ascii=False).encode('utf-8')
+    compressed = zlib.compress(raw)
+    return base64.urlsafe_b64encode(compressed).decode('utf-8')
+
+def decode_voucher_data(d: str) -> dict:
+    """ถอดรหัสข้อมูล Voucher (รองรับทั้ง zlib compressed และ Base64 ธรรมดา)"""
+    compressed = base64.urlsafe_b64decode(d.encode('utf-8'))
+    try:
+        raw = zlib.decompress(compressed)
+        return json.loads(raw.decode('utf-8'))
+    except Exception:
+        return json.loads(compressed.decode('utf-8'))
+
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "Payment Voucher LINE Bot Server is running"}
@@ -58,18 +75,18 @@ def generate_and_download_pdf(d: str):
     (การันตีดาวน์โหลดได้สมบูรณ์ 100% บน Vercel Serverless โดยไม่ติดปัญหา 404 Not Found)
     """
     try:
-        # ถอดรหัส Base64 ข้อมูล Voucher
-        json_bytes = base64.urlsafe_b64decode(d.encode('utf-8'))
-        data = json.loads(json_bytes.decode('utf-8'))
+        # ถอดรหัสข้อมูล Voucher
+        data = decode_voucher_data(d)
         
         voucher_id = data.get("voucher_no", "VOUCHER")
-        filename = f"{voucher_id}.pdf"
-        filepath = os.path.join(OUTPUT_DIR, filename)
+        # แปลงตัวอักษรพิเศษในเลขที่เอกสาร (เช่น / หรือ \) เป็น _ เพื่อป้องกันปัญหา File path error
+        safe_filename = re.sub(r'[^a-zA-Z0-9_-]', '_', voucher_id) + ".pdf"
+        filepath = os.path.join(OUTPUT_DIR, safe_filename)
         
         # สร้าง PDF เรียลไทม์
         create_payment_voucher_pdf(filepath, data)
         
-        return FileResponse(filepath, media_type="application/pdf", filename=filename)
+        return FileResponse(filepath, media_type="application/pdf", filename=safe_filename)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid or expired PDF request: {str(e)}")
 
@@ -124,7 +141,7 @@ def handle_file_or_image_message(event):
         extracted_data["voucher_no"] = voucher_id
 
         # 3. สร้างลิงก์ดาวน์โหลด On-the-Fly (รองรับ Vercel Serverless 100%)
-        encoded_data = base64.urlsafe_b64encode(json.dumps(extracted_data).encode('utf-8')).decode('utf-8')
+        encoded_data = encode_voucher_data(extracted_data)
         pdf_url = f"{BASE_URL.rstrip('/')}/pdf?d={encoded_data}"
 
         # 4. ส่ง Flex Message สรุปผล
