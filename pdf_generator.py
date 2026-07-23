@@ -169,7 +169,7 @@ def create_payment_voucher_pdf(output_path: str, data: dict):
         particulars_paragraph = Paragraph(particulars_text, normal_style)
         
         table_data.append([
-            item.get("date", ""),
+            "",  # เว้นช่อง Date ในตารางรายการให้เป็น Blank ตามต้องการ
             particulars_paragraph,
             f"{amt:,.2f}" if amt else "-",
             f"{vat:,.2f}" if vat else "-",
