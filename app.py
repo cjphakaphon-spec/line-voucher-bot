@@ -13,10 +13,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError, LineBotApiError
+from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
-    MessageEvent, ImageMessage, FileMessage, TextMessage, TextSendMessage, FlexSendMessage,
-    QuickReply, QuickReplyButton, MessageAction,
+    MessageEvent, ImageMessage, FileMessage, TextSendMessage, FlexSendMessage,
     BubbleContainer, BoxComponent, TextComponent, ButtonComponent, URIAction
 )
 
@@ -42,47 +41,20 @@ BASE_URL = os.getenv("BASE_URL", "https://your-domain.ngrok-free.app") # URL ส
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# --- ฟังก์ชันย่อ/ถอดรหัสข้อมูล Voucher สั้นพิเศษเพื่อไม่ให้เกินความยาวของ LINE URI Limit ---
 def encode_voucher_data(data: dict) -> str:
+    """บีบอัดข้อมูลด้วย zlib + Base64 เพื่อให้ URL สั้นที่สุด"""
     raw = json.dumps(data, ensure_ascii=False).encode('utf-8')
     compressed = zlib.compress(raw)
     return base64.urlsafe_b64encode(compressed).decode('utf-8')
 
 def decode_voucher_data(d: str) -> dict:
+    """ถอดรหัสข้อมูล Voucher"""
     compressed = base64.urlsafe_b64decode(d.encode('utf-8'))
     try:
         raw = zlib.decompress(compressed)
         return json.loads(raw.decode('utf-8'))
     except Exception:
-        # Fallback กรณีข้อความเก่าเป็น Base64 ธรรมดาที่ไม่ผ่าน zlib
         return json.loads(compressed.decode('utf-8'))
-
-# --- ระบบจัดการ Session รายการสะสมของผู้ใช้ ---
-def get_user_session_path(user_id: str) -> str:
-    return os.path.join(tempfile.gettempdir(), f"session_{user_id}.json")
-
-def load_user_session(user_id: str) -> dict:
-    path = get_user_session_path(user_id)
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"items": [], "pay_to": "", "date": "", "voucher_no": ""}
-
-def save_user_session(user_id: str, session_data: dict):
-    path = get_user_session_path(user_id)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(session_data, f, ensure_ascii=False)
-
-def clear_user_session(user_id: str):
-    path = get_user_session_path(user_id)
-    if os.path.exists(path):
-        try:
-            os.remove(path)
-        except Exception:
-            pass
 
 @app.get("/")
 def read_root():
@@ -143,162 +115,72 @@ def handle_file_or_image_message(event):
         elif file_name.endswith(".jpg") or file_name.endswith(".jpeg"):
             mime_type = "image/jpeg"
 
+    # แจ้งเตือนผู้ใช้ว่ากำลังประมวลผล
     line_bot_api.reply_message(
         reply_token,
-        TextSendMessage(text="⏳ กำลังอ่านข้อมูลใบเสร็จด้วย AI กรุณารอสักครู่ครับ...")
+        TextSendMessage(text="⏳ กำลังอ่านข้อมูลใบเสร็จด้วย AI และสร้าง Payment Voucher กรุณารอสักครู่ครับ...")
     )
 
     try:
+        # 1. ดึงไฟล์รูปภาพ/เอกสารจาก LINE API
         message_content = line_bot_api.get_message_content(message_id)
         file_bytes = b""
         for chunk in message_content.iter_content():
             file_bytes += chunk
 
+        # 2. OCR ด้วย Gemini API (ใบเดียวสแกนจบ)
         extracted_data = extract_receipt_data(file_bytes, mime_type=mime_type)
 
-        session = load_user_session(user_id)
-        new_item = extracted_data.get("items", [{}])[0]
-        session["items"].append(new_item)
+        # 3. กำหนดเลขที่เอกสาร
+        voucher_id = extracted_data.get("voucher_no")
+        if not voucher_id or str(voucher_id).strip() in ["", "-", "None"]:
+            voucher_id = f"PV-{uuid.uuid4().hex[:6].upper()}"
+        extracted_data["voucher_no"] = voucher_id
 
-        if not session.get("pay_to"):
-            session["pay_to"] = extracted_data.get("pay_to", "")
-        if not session.get("date"):
-            session["date"] = extracted_data.get("date", "")
-        if not session.get("voucher_no"):
-            session["voucher_no"] = extracted_data.get("voucher_no", "")
+        # 4. สร้างลิงก์ดาวน์โหลด On-the-Fly
+        encoded_data = encode_voucher_data(extracted_data)
+        pdf_url = f"{BASE_URL.rstrip('/')}/pdf?d={encoded_data}"
 
-        save_user_session(user_id, session)
+        # 5. ส่ง Flex Message การ์ดดาวน์โหลด PDF ให้ผู้ใช้ทันที
+        pay_to = extracted_data.get("pay_to", "-")
+        net_pay = extracted_data.get("net_pay", 0.0)
 
-        count = len(session["items"])
-        last_item_text = new_item.get("particulars", "รายการใหม่")
-        last_item_net = new_item.get("total", 0.0)
-        total_accumulated = sum(item.get("total", 0.0) for item in session["items"])
-
-        reply_text = (
-            f"📥 บันทึกรายการที่ {count} เรียบร้อยแล้ว!\n"
-            f"• รายการ: {last_item_text}\n"
-            f"• ยอดรวมรายการนี้: {last_item_net:,.2f} THB\n\n"
-            f"📊 ยอดสะสมรวมขณะนี้ ({count} รายการ): {total_accumulated:,.2f} THB\n\n"
-            f"❓ มีใบเสร็จ/ใบแจ้งหนี้อื่นที่จะรวมจ่ายในใบสำคัญจ่ายเดียวกันอีกไหมครับ?"
+        flex_message = FlexSendMessage(
+            alt_text=f"สร้าง Payment Voucher {voucher_id} สำเร็จแล้ว",
+            contents=BubbleContainer(
+                header=BoxComponent(
+                    layout="vertical",
+                    contents=[
+                        TextComponent(text="✅ สร้าง Payment Voucher สำเร็จ", weight="bold", color="#1DB446", size="md"),
+                        TextComponent(text=f"เลขที่: {voucher_id}", size="xs", color="#aaaaaa")
+                    ]
+                ),
+                body=BoxComponent(
+                    layout="vertical",
+                    contents=[
+                        TextComponent(text=f"จ่ายให้: {pay_to}", weight="bold", size="sm"),
+                        TextComponent(text=f"ยอดจ่ายสุทธิ: {net_pay:,.2f} THB", size="lg", weight="bold", color="#111111")
+                    ]
+                ),
+                footer=BoxComponent(
+                    layout="vertical",
+                    contents=[
+                        ButtonComponent(
+                            action=URIAction(label="📄 ดาวน์โหลด PDF Voucher", uri=pdf_url),
+                            style="primary",
+                            color="#0066CC"
+                        )
+                    ]
+                )
+            )
         )
 
-        quick_reply = QuickReply(
-            items=[
-                QuickReplyButton(action=MessageAction(label="✅ ออก PDF (สิ้นสุด)", text="ออก PDF")),
-                QuickReplyButton(action=MessageAction(label="➕ เพิ่มรายการอีก", text="เพิ่มรายการอีก")),
-                QuickReplyButton(action=MessageAction(label="🔄 ยกเลิกรายการ", text="ยกเลิก"))
-            ]
-        )
-
-        line_bot_api.push_message(
-            user_id,
-            TextSendMessage(text=reply_text, quick_reply=quick_reply)
-        )
+        line_bot_api.push_message(user_id, flex_message)
 
     except Exception as e:
         line_bot_api.push_message(
             user_id,
             TextSendMessage(text=f"❌ เกิดข้อผิดพลาดในการประมวลผลใบเสร็จ: {str(e)}")
-        )
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_text_message(event):
-    user_id = event.source.user_id
-    user_text = event.message.text.strip().lower()
-
-    try:
-        finish_keywords = [
-            "ออก pdf", "ออกpdf", "สร้าง pdf", "สร้างpdf", "pdf",
-            "สิ้นสุดรายการ", "สิ้นสุด", "ใช่", "เสร็จแล้ว", "เสร็จ",
-            "ออกใบสำคัญจ่าย", "ออก pdf (สิ้นสุด)"
-        ]
-        
-        is_finish = any(kw in user_text for kw in finish_keywords) or user_text.startswith("ออก") or user_text.startswith("สร้าง")
-
-        if is_finish:
-            session = load_user_session(user_id)
-            items = session.get("items", [])
-
-            if not items:
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text="⚠️ ยังไม่มีรายการใบเสร็จสะสมในระบบ กรุณาถ่ายรูปหรือส่งไฟล์ใบเสร็จเข้ามาก่อนครับ")
-                )
-                return
-
-            voucher_id = session.get("voucher_no")
-            if not voucher_id or str(voucher_id).strip() in ["", "-", "None"]:
-                voucher_id = f"PV-{uuid.uuid4().hex[:6].upper()}"
-
-            combined_data = {
-                "voucher_no": voucher_id,
-                "date": session.get("date", ""),
-                "pay_to": session.get("pay_to", ""),
-                "items": items,
-                "net_pay": sum(item.get("total", 0.0) for item in items)
-            }
-
-            # บีบอัดข้อมูลด้วย zlib + Base64 เพื่อให้ URL สั้นไม่เกินข้อกำหนด 1,000 ตัวอักษรของ LINE URI Limit
-            encoded_data = encode_voucher_data(combined_data)
-            pdf_url = f"{BASE_URL.rstrip('/')}/pdf?d={encoded_data}"
-
-            pay_to = combined_data.get("pay_to", "-")
-            net_pay = combined_data.get("net_pay", 0.0)
-            item_count = len(items)
-
-            flex_message = FlexSendMessage(
-                alt_text=f"สร้าง Payment Voucher {voucher_id} ({item_count} รายการ) สำเร็จแล้ว",
-                contents=BubbleContainer(
-                    header=BoxComponent(
-                        layout="vertical",
-                        contents=[
-                            TextComponent(text="✅ สร้าง Payment Voucher สำเร็จ", weight="bold", color="#1DB446", size="md"),
-                            TextComponent(text=f"เลขที่: {voucher_id} ({item_count} รายการ)", size="xs", color="#aaaaaa")
-                        ]
-                    ),
-                    body=BoxComponent(
-                        layout="vertical",
-                        contents=[
-                            TextComponent(text=f"จ่ายให้: {pay_to}", weight="bold", size="sm"),
-                            TextComponent(text=f"ยอดจ่ายสุทธิรวม: {net_pay:,.2f} THB", size="lg", weight="bold", color="#111111")
-                        ]
-                    ),
-                    footer=BoxComponent(
-                        layout="vertical",
-                        contents=[
-                            ButtonComponent(
-                                action=URIAction(label="📄 ดาวน์โหลด PDF Voucher", uri=pdf_url),
-                                style="primary",
-                                color="#0066CC"
-                            )
-                        ]
-                    )
-                )
-            )
-
-            # ใช้ push_message เพื่อป้องกัน reply_token หมดอายุหากเกิดความผิดพลาด
-            line_bot_api.push_message(user_id, flex_message)
-            clear_user_session(user_id)
-
-        elif any(kw in user_text for kw in ["เพิ่มรายการอีก", "เพิ่มรายการ", "ไม่", "ยัง"]):
-            session = load_user_session(user_id)
-            count = len(session.get("items", []))
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"📸 รับทราบครับ (ขณะนี้สะสมอยู่ {count} รายการ)\n\nกรุณาถ่ายรูปหรือส่งไฟล์ใบเสร็จใบถัดไปมาได้เลยครับ ระบบจะนำไปใส่ในบรรทัดที่ {count + 1} ให้ทันที")
-            )
-
-        elif any(kw in user_text for kw in ["ยกเลิก", "เริ่มใหม่", "ลบ", "reset"]):
-            clear_user_session(user_id)
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="🔄 ยกเลิกรายการสะสมเรียบร้อยแล้วครับ สามารถถ่ายรูปหรือส่งไฟล์ใบเสร็จเพื่อเริ่มใหม่ได้ทันที")
-            )
-
-    except Exception as e:
-        line_bot_api.push_message(
-            user_id,
-            TextSendMessage(text=f"❌ เกิดข้อผิดพลาดในการสร้าง PDF: {str(e)}")
         )
 
 if __name__ == "__main__":
