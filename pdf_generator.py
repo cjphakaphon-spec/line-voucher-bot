@@ -158,7 +158,9 @@ def create_payment_voucher_pdf(output_path: str, data: dict):
         amt = float(item.get("amount", 0.0))
         vat = float(item.get("vat", 0.0))
         wh = float(item.get("wh_tax", 0.0))
-        tot = float(item.get("total", amt + vat))
+        tot = float(item.get("total", amt + vat - wh))
+        if wh > 0 and abs(tot - (amt + vat)) < 0.01:
+            tot = amt + vat - wh
         
         total_amt += amt
         total_vat += vat

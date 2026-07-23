@@ -23,17 +23,17 @@ PROMPT_EXTRACT_RECEIPT = """
   "amount": ยอดเงินก่อน VAT (ตัวเลข float เช่น 1000.00),
   "vat": ยอดภาษีมูลค่าเพิ่ม 7% (ตัวเลข float เช่น 70.00 ถ้าไม่มีให้ใส่ 0.00),
   "wh_tax": ยอดภาษีหัก ณ ที่จ่าย (ตัวเลข float เช่น 30.00 ถ้าไม่มีให้ใส่ 0.00),
-  "total": ยอดเงินรวมก่อนหัก ณ ที่จ่าย (ตัวเลข float เช่น 1070.00),
-  "net_pay": ยอดเงินจ่ายจริง/สุทธิ หลังหัก ณ ที่จ่าย (ตัวเลข float เช่น 1040.00)
+  "total": ยอดเงินรวมสุทธิหลังหัก ณ ที่จ่าย (ตัวเลข float เช่น 1040.00 = amount + vat - wh_tax),
+  "net_pay": ยอดเงินจ่ายจริง/สุทธิ (ตัวเลข float เช่น 1040.00)
 }
 
 กฎเพิ่มเติมสำหรับการประมวลผลข้อมูลและโน้ตลายมือ:
 1. การตรวจจับโน้ตลายมือ (Handwritten Notes):
    - สังเกตข้อความลายมือหรือโน้ตที่เขียนเพิ่มเติมบนเอกสาร หากมีข้อความระบุเกี่ยวกับการหัก ณ ที่จ่าย (เช่น "หัก ณ ที่จ่าย 3%", "หัก 3%", "W/H 3%", หรือระบุยอดตัวเลขหัก ณ ที่จ่าย) ให้สกัดค่านั้นลงในช่อง `wh_tax`
    - หากระบุเป็นเปอร์เซ็นต์ (เช่น หัก 3% หรือ 1%) ให้คำนวณยอด `wh_tax` จากยอดเงินก่อน VAT (`amount`) ตัวอย่างเช่น: ยอดก่อน VAT = 1,000 บาท หัก 3% จะได้ `wh_tax = 30.00`
-2. การคำนวณยอดเงิน:
-   - ยอดรวมก่อนหัก ณ ที่จ่าย (`total`) = ยอดก่อน VAT (`amount`) + ภาษีมูลค่าเพิ่ม (`vat`)
-   - ยอดเงินจ่ายจริง (`net_pay`) = ยอดรวม (`total`) - ภาษีหัก ณ ที่จ่าย (`wh_tax`)
+2. การคำนวณยอดเงินรวม (Total) และสุทธิ (Net Pay):
+   - ยอดเงินรวมในช่อง Total (`total`) = ยอดก่อน VAT (`amount`) + ภาษีมูลค่าเพิ่ม (`vat`) - ภาษีหัก ณ ที่จ่าย (`wh_tax`)
+   - ยอดเงินจ่ายจริง (`net_pay`) = ยอดเงินรวม (`total`)
 3. การระวังแยกแยะตัวอักษร IV กับ N ของเลขที่เอกสาร (voucher_no):
    - หากเป็นเอกสารประเภท ใบกำกับภาษี / ใบแจ้งหนี้ (Tax Invoice / Invoice) แล้วพบรหัสขึ้นต้นด้วย N ตามด้วยตัวเลขชิดกัน (เช่น N6900249) ให้สังเกตขีดและเส้นของตัวอักษรอย่างละเอียด หากต้นฉบับคือ IV (Invoice) ให้คืนค่าเป็น "IV6900249"
    - หากเอกสารนั้นมี Prefix ตัว N จริงๆ หรือเป็นเอกสารประเภท Note / Delivery Note / Form N ให้คงค่า "N..." ไว้ตามต้นฉบับจริง ห้ามเปลี่ยนเป็น IV
@@ -60,7 +60,7 @@ def clean_extracted_voucher_no(voucher_no: str) -> str:
 def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_key: str = None) -> Dict[str, Any]:
     """
     อ่านข้อมูลใบเสร็จจากรูปภาพหรือไฟล์ PDF โดยใช้ Gemini Vision API
-    รองรับการอ่านโน้ตลายมือ การคำนวณหัก ณ ที่จ่าย และคำนวณยอดสุทธอัตโนมัติ
+    รองรับการคำนวณยอดในช่อง Total ให้หักลบยอด W/H Tax อัตโนมัติ
     """
     if not api_key:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -72,7 +72,6 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
     last_error = None
 
     for attempt in range(1, 3):
-        # 1. ลองผ่าน SDK google.generativeai
         try:
             import google.generativeai as genai
             genai.configure(api_key=api_key)
@@ -102,8 +101,10 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                     amount = float(data.get("amount", 0.0))
                     vat = float(data.get("vat", 0.0))
                     wh_tax = float(data.get("wh_tax", 0.0))
-                    total = float(data.get("total", amount + vat))
-                    net_pay = float(data.get("net_pay", total - wh_tax))
+                    
+                    # คำนวณ Total = Amount + VAT - W/H Tax ตามต้องการ
+                    total = amount + vat - wh_tax
+                    net_pay = float(data.get("net_pay", total))
                     
                     return {
                         "voucher_no": clean_vno,
@@ -168,8 +169,10 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str = "image/jpeg", api_k
                     amount = float(data.get("amount", 0.0))
                     vat = float(data.get("vat", 0.0))
                     wh_tax = float(data.get("wh_tax", 0.0))
-                    total = float(data.get("total", amount + vat))
-                    net_pay = float(data.get("net_pay", total - wh_tax))
+                    
+                    # คำนวณ Total = Amount + VAT - W/H Tax ตามต้องการ
+                    total = amount + vat - wh_tax
+                    net_pay = float(data.get("net_pay", total))
 
                     return {
                         "voucher_no": clean_vno,
